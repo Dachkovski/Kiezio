@@ -138,6 +138,17 @@ def create_schema(conn):
             created_at TEXT NOT NULL,
             completed_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS appeals (
+            id TEXT PRIMARY KEY,
+            post_id TEXT NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+            user_id TEXT NOT NULL REFERENCES users(id),
+            appeal_text TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            resolved_at TEXT,
+            decision_notes TEXT
+        );
         """
     )
 
@@ -497,6 +508,7 @@ def export_user_data(conn, user_id):
     reports = conn.execute("SELECT * FROM reports WHERE reporter_id = ? ORDER BY created_at DESC", (user_id,)).fetchall()
     audit_rows = conn.execute("SELECT * FROM audit_log WHERE actor_id = ? ORDER BY created_at DESC LIMIT 200", (user_id,)).fetchall()
     authored_posts = conn.execute("SELECT * FROM posts WHERE author_id = ? AND deleted_at IS NULL ORDER BY created_at DESC", (user_id,)).fetchall()
+    appeals = conn.execute("SELECT * FROM appeals WHERE user_id = ? ORDER BY created_at DESC", (user_id,)).fetchall()
     return {
         "userID": user_id,
         "exportedAt": now_iso(),
@@ -504,6 +516,7 @@ def export_user_data(conn, user_id):
         "reports": [report_to_json(row) for row in reports],
         "controls": [dict(row) for row in rows],
         "auditLog": [dict(row) for row in audit_rows],
+        "appeals": [appeal_to_json(row) for row in appeals],
     }
 
 
@@ -514,12 +527,104 @@ def delete_account(conn, user_id):
     conn.execute("UPDATE replies SET deleted_at = ? WHERE author_id = ?", (completed, user_id))
     conn.execute("DELETE FROM reactions WHERE user_id = ?", (user_id,))
     conn.execute("DELETE FROM controls WHERE user_id = ?", (user_id,))
+    conn.execute("DELETE FROM appeals WHERE user_id = ?", (user_id,))
     conn.execute(
         "INSERT INTO account_deletions(id, user_id, created_at, completed_at) VALUES (?, ?, ?, ?)",
         (new_id(), user_id, completed, completed),
     )
     audit(conn, user_id, "account.deleted", "user", user_id, {"completedAt": completed})
     return {"deleted": True, "completedAt": completed}
+
+
+def appeal_to_json(row):
+    return {
+        "id": row["id"],
+        "postID": row["post_id"],
+        "userID": row["user_id"],
+        "appealText": row["appeal_text"],
+        "createdAt": row["created_at"],
+        "status": row["status"],
+        "resolvedAt": row["resolved_at"],
+        "decisionNotes": row["decision_notes"],
+    }
+
+
+def create_appeal(conn, user_id, post_id, data):
+    check_rate_limit(conn, user_id, "appeal", 10, 3600)
+    appeal_text = str(data.get("appealText", "")).strip()
+    if len(appeal_text) < 5 or len(appeal_text) > 500:
+        raise ApiError(422, "invalid_text", "Einspruch-Begruendung muss zwischen 5 und 500 Zeichen lang sein.")
+
+    post = conn.execute("SELECT * FROM posts WHERE id = ? AND deleted_at IS NULL", (post_id,)).fetchone()
+    if not post:
+        raise ApiError(404, "not_found", "Beitrag nicht gefunden.")
+
+    # Only the author of the post can appeal content removal/restriction
+    if post["author_id"] != user_id:
+        raise ApiError(403, "forbidden", "Nur der Autor dieses Beitrags kann Einspruch einlegen.")
+
+    # Only allow appeals for restricted content (underReview or removed)
+    if post["moderation_status"] not in ["removed", "underReview"]:
+        raise ApiError(422, "invalid_state", "Dieser Beitrag ist aktiv und benoetigt keinen Einspruch.")
+
+    # Check for existing pending appeal
+    existing = conn.execute(
+        "SELECT id FROM appeals WHERE post_id = ? AND user_id = ? AND status = 'pending'",
+        (post_id, user_id),
+    ).fetchone()
+    if existing:
+        raise ApiError(409, "already_exists", "Es liegt bereits ein offener Einspruch fuer diesen Beitrag vor.")
+
+    appeal_id = new_id()
+    conn.execute(
+        """
+        INSERT INTO appeals(id, post_id, user_id, appeal_text, created_at, status)
+        VALUES (?, ?, ?, ?, ?, 'pending')
+        """,
+        (appeal_id, post_id, user_id, appeal_text, now_iso()),
+    )
+    audit(conn, user_id, "appeal.created", "appeal", appeal_id, {"postID": post_id})
+    return appeal_to_json(conn.execute("SELECT * FROM appeals WHERE id = ?", (appeal_id,)).fetchone())
+
+
+def require_moderator_actor(actor_id):
+    if not actor_id.startswith(("moderator-", "admin-")):
+        raise ApiError(403, "forbidden", "Nur Moderator:innen koennen Einsprueche einsehen oder entscheiden.")
+
+
+def resolve_appeal(conn, actor_id, appeal_id, data):
+    require_moderator_actor(actor_id)
+    status = data.get("status")
+    decision_notes = str(data.get("decisionNotes", "")).strip()
+    if status not in ["approved", "rejected"]:
+        raise ApiError(422, "invalid_status", "Status muss 'approved' oder 'rejected' sein.")
+
+    appeal = conn.execute("SELECT * FROM appeals WHERE id = ?", (appeal_id,)).fetchone()
+    if not appeal:
+        raise ApiError(404, "not_found", "Einspruch nicht gefunden.")
+
+    if appeal["status"] != "pending":
+        raise ApiError(422, "already_resolved", "Dieser Einspruch wurde bereits bearbeitet.")
+
+    post_id = appeal["post_id"]
+    now = now_iso()
+    conn.execute(
+        "UPDATE appeals SET status = ?, resolved_at = ?, decision_notes = ? WHERE id = ?",
+        (status, now, decision_notes, appeal_id),
+    )
+
+    if status == "approved":
+        # Restore the post
+        conn.execute(
+            "UPDATE posts SET moderation_status = 'visible', removal_reason = NULL, report_count = 0 WHERE id = ?",
+            (post_id,),
+        )
+        audit(conn, actor_id, "post.restored", "post", post_id, {"appealID": appeal_id, "notes": decision_notes})
+    else:
+        audit(conn, actor_id, "appeal.rejected", "appeal", appeal_id, {"postID": post_id, "notes": decision_notes})
+
+    audit(conn, actor_id, "appeal.resolved", "appeal", appeal_id, {"status": status})
+    return appeal_to_json(conn.execute("SELECT * FROM appeals WHERE id = ?", (appeal_id,)).fetchone())
 
 
 class ApiError(Exception):
@@ -590,6 +695,14 @@ class KiezioHandler(BaseHTTPRequestHandler):
         if method == "GET" and path == "/audit":
             rows = conn.execute("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 200").fetchall()
             return {"auditLog": [dict(row) for row in rows]}
+        if method == "POST" and len(parts) == 3 and parts[0] == "posts" and parts[2] == "appeal":
+            return create_appeal(conn, user_id, parts[1], body)
+        if method == "POST" and len(parts) == 3 and parts[0] == "appeals" and parts[2] == "resolve":
+            return resolve_appeal(conn, user_id, parts[1], body)
+        if method == "GET" and path == "/appeals":
+            require_moderator_actor(user_id)
+            rows = conn.execute("SELECT * FROM appeals ORDER BY created_at DESC").fetchall()
+            return {"appeals": [appeal_to_json(row) for row in rows], "count": len(rows)}
         raise ApiError(404, "not_found", "Endpoint nicht gefunden.")
 
     def read_json(self):

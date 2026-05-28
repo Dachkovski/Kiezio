@@ -145,6 +145,119 @@ class BackendTestCase(unittest.TestCase):
             )
         self.assertEqual(context.exception.code, 429)
 
+    def test_content_moderation_appeals(self):
+        # 1. Create a post as appeal-user
+        post = self.request(
+            "POST",
+            "/posts",
+            {"text": "Dieser Beitrag wird gleich mehrfach gemeldet.", "category": "Fragen", "spaceID": "questions", "reach": "Bezirk"},
+            user_id="appeal-user"
+        )
+        post_id = post["id"]
+
+        # 2. Denying appeal on a visible post (returns 422)
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            self.request(
+                "POST",
+                f"/posts/{post_id}/appeal",
+                {"appealText": "Ich moechte Einspruch einlegen."},
+                user_id="appeal-user"
+            )
+        self.assertEqual(context.exception.code, 422)
+
+        # 3. Report the post 4 times to get it removed automatically
+        for index in range(4):
+            self.request(
+                "POST",
+                "/reports",
+                {"targetKind": "post", "targetID": post_id, "reason": "Spam"},
+                user_id=f"reporter-{index}"
+            )
+
+        # Check that the post is indeed removed
+        feed = self.request("GET", "/posts", user_id="some-other-user")
+        self.assertNotIn(post_id, [p["id"] for p in feed])
+
+        # 4. Denying appeal by non-author (returns 403)
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            self.request(
+                "POST",
+                f"/posts/{post_id}/appeal",
+                {"appealText": "Ich bin nicht der Autor aber will Einspruch."},
+                user_id="intruder-user"
+            )
+        self.assertEqual(context.exception.code, 403)
+
+        # 5. Successfully submit appeal by author
+        appeal = self.request(
+            "POST",
+            f"/posts/{post_id}/appeal",
+            {"appealText": "Das ist eine legitime Frage ueber meinen Kiez und kein Spam."},
+            user_id="appeal-user"
+        )
+        self.assertEqual(appeal["status"], "pending")
+        self.assertEqual(appeal["postID"], post_id)
+        self.assertEqual(appeal["userID"], "appeal-user")
+        appeal_id = appeal["id"]
+
+        # 6. Block duplicate pending appeals (returns 409)
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            self.request(
+                "POST",
+                f"/posts/{post_id}/appeal",
+                {"appealText": "Noch ein Einspruch."},
+                user_id="appeal-user"
+            )
+        self.assertEqual(context.exception.code, 409)
+
+        # Verify that a normal user cannot access the moderation appeal queue.
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            self.request("GET", "/appeals", user_id="some-other-user")
+        self.assertEqual(context.exception.code, 403)
+
+        # Verify that GET /appeals returns the appeal for moderation actors.
+        all_appeals = self.request("GET", "/appeals", user_id="admin-user")
+        self.assertIn(appeal_id, [a["id"] for a in all_appeals["appeals"]])
+
+        # Verify that export_user_data contains the appeal
+        export = self.request("GET", "/me/export", user_id="appeal-user")
+        self.assertIn(appeal_id, [a["id"] for a in export["appeals"]])
+
+        # Non-moderators cannot decide appeals.
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            self.request(
+                "POST",
+                f"/appeals/{appeal_id}/resolve",
+                {"status": "approved", "decisionNotes": "Nicht autorisierte Entscheidung."},
+                user_id="some-other-user"
+            )
+        self.assertEqual(context.exception.code, 403)
+
+        # 7. Resolve the appeal as approved (restores post)
+        resolved = self.request(
+            "POST",
+            f"/appeals/{appeal_id}/resolve",
+            {"status": "approved", "decisionNotes": "Nach manueller Pruefung freigegeben."},
+            user_id="moderator-user"
+        )
+        self.assertEqual(resolved["status"], "approved")
+        self.assertEqual(resolved["decisionNotes"], "Nach manueller Pruefung freigegeben.")
+
+        # Check that post is now visible again in the feed and report count reset
+        feed_after = self.request("GET", "/posts", user_id="some-other-user")
+        restored_post = next((p for p in feed_after if p["id"] == post_id), None)
+        self.assertIsNotNone(restored_post)
+        self.assertEqual(restored_post["moderationStatus"], "visible")
+        self.assertEqual(restored_post["reportCount"], 0)
+
+        # 8. Check that account deletion deletes the appeal
+        result = self.request("DELETE", "/me", user_id="appeal-user")
+        self.assertTrue(result["deleted"])
+
+        # The appeal should no longer be returned in general appeals list
+        all_appeals_after = self.request("GET", "/appeals", user_id="admin-user")
+        self.assertNotIn(appeal_id, [a["id"] for a in all_appeals_after["appeals"]])
+
 
 if __name__ == "__main__":
     unittest.main()
